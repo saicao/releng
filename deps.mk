@@ -3,7 +3,7 @@ frida_bootstrap_version = 20240118
 
 
 frida_base_url = https://github.com/frida
-
+cs_frida_base_url = https://github.com/saicao
 
 include releng/system.mk
 
@@ -504,8 +504,8 @@ libsoup_deps_for_build = \
 	$(NULL)
 
 capstone_name = Capstone
-capstone_version = e98746112da0a40b2ccd0340db0d20cca5f97950
-capstone_url = $(frida_base_url)/capstone.git
+capstone_version = 53ae0e3bbf5efa8845d9fa2c6979dcb7a9c9fd05
+capstone_url = $(cs_frida_base_url)/capstone.git
 capstone_recipe = meson
 capstone_patches = \
 	$(NULL)
