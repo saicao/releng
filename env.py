@@ -1,15 +1,36 @@
+from collections import OrderedDict
 from configparser import ConfigParser
-import io
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import platform
+import shlex
+import shutil
 import subprocess
 import sys
-from typing import Callable, Literal, Optional, Sequence
+from typing import Callable, Literal, Optional
 
-from . import deps, env_android, env_apple, env_generic, machine_file
-from .machine_file import str_to_meson, strv_to_meson
+from . import env_android, env_apple, env_generic, machine_file
+from .machine_file import bool_to_meson, str_to_meson, strv_to_meson
 from .machine_spec import MachineSpec
+
+
+@dataclass
+class MachineConfig:
+    machine_file: Path
+    binpath: list[Path]
+    environ: dict[str, str]
+
+    def make_merged_environment(self, source_environ: dict[str, str]) -> dict[str, str]:
+        menv = {**source_environ}
+        menv.update(self.environ)
+
+        if self.binpath:
+            old_path = menv.get("PATH", "")
+            old_dirs = old_path.split(os.pathsep) if old_path else []
+            menv["PATH"] = os.pathsep.join([str(p) for p in self.binpath] + old_dirs)
+
+        return menv
 
 
 DefaultLibrary = Literal["shared", "static"]
@@ -33,114 +54,84 @@ def query_machine_file_path(machine: MachineSpec, flavor: str, build_dir: Path) 
     return build_dir / f"frida{flavor}-{machine.identifier}.txt"
 
 
-def enumerate_build_dirs(build_dir: Path):
-    return build_dir.glob("tmp-*/*")
-
-
-def query_devkit_output_dir(name: str, build_dir: Path) -> Path:
-    return build_dir / "devkits" / name
-
-
-def detect_native_machine() -> MachineSpec:
-    nos = detect_native_os()
-    config = "release" if nos == "windows" else None
-    return MachineSpec(nos, detect_native_arch(), config)
-
-
-def detect_native_os() -> str:
-    nos = platform.system().lower()
-    if nos == "darwin":
-        nos = "macos"
-    return nos
-
-
-def detect_native_arch() -> str:
-    arch = platform.machine().lower()
-    if arch == "amd64":
-        arch = "x86_64"
-    return arch
-
-
-def detect_native_default_prefix() -> Path:
+def detect_default_prefix() -> Path:
     if platform.system() == "Windows":
         return Path(os.environ["ProgramFiles"]) / "Frida"
     return Path("/usr/local")
 
 
-def generate_machine_files(build_machine: MachineSpec,
-                           build_sdk_prefix: Optional[Path],
-                           host_machine: MachineSpec,
-                           host_sdk_prefix: Optional[Path],
-                           toolchain_prefix: Optional[Path],
-                           default_library: DefaultLibrary,
-                           call_selected_meson: Callable,
-                           build_dir: Path):
+def generate_machine_configs(build_machine: MachineSpec,
+                             host_machine: MachineSpec,
+                             environ: dict[str, str],
+                             toolchain_prefix: Optional[Path],
+                             build_sdk_prefix: Optional[Path],
+                             host_sdk_prefix: Optional[Path],
+                             call_selected_meson: Callable,
+                             default_library: DefaultLibrary,
+                             outdir: Path) -> tuple[MachineConfig, MachineConfig]:
     is_cross_build = host_machine != build_machine
 
-    build_config, build_machine_path, build_machine_env = \
+    if is_cross_build:
+        build_environ = {build_envvar_to_host(k): v for k, v in environ.items() if k not in TOOLCHAIN_ENVVARS}
+    else:
+        build_environ = environ
+
+    build_config = \
             generate_machine_config(build_machine,
-                                    build_sdk_prefix,
                                     build_machine,
                                     is_cross_build,
+                                    build_environ,
                                     toolchain_prefix,
+                                    build_sdk_prefix,
+                                    call_selected_meson,
                                     default_library,
-                                    call_selected_meson)
+                                    outdir)
 
     if is_cross_build:
-        host_config, host_machine_path, host_machine_env = \
-                generate_machine_config(host_machine,
-                                        host_sdk_prefix,
-                                        build_machine,
-                                        is_cross_build,
-                                        toolchain_prefix,
-                                        default_library,
-                                        call_selected_meson)
+        host_config = generate_machine_config(host_machine,
+                                              build_machine,
+                                              is_cross_build,
+                                              environ,
+                                              toolchain_prefix,
+                                              host_sdk_prefix,
+                                              call_selected_meson,
+                                              default_library,
+                                              outdir)
     else:
-        host_config = None
-        host_machine_path = []
-        host_machine_env = {}
+        host_config = build_config
 
-    build_dir.mkdir(parents=True, exist_ok=True)
-    build_file = write_machine_file(build_machine, build_config, build_dir)
-    host_file = write_machine_file(host_machine, host_config, build_dir)
-
-    return (
-        build_file,
-        host_file,
-        build_machine_path + host_machine_path,
-        {**build_machine_env, **host_machine_env},
-    )
-
-
-def write_machine_file(machine: MachineSpec,
-                       config: Optional[str],
-                       build_dir: Path) -> Path:
-    if config is None:
-        return None
-
-    f = build_dir / f"frida-{machine.identifier}.txt"
-    f.write_text(config, encoding="utf-8")
-
-    return f
+    return (build_config, host_config)
 
 
 def generate_machine_config(machine: MachineSpec,
-                            sdk_prefix: Optional[Path],
-                            native_machine: MachineSpec,
+                            build_machine: MachineSpec,
                             is_cross_build: bool,
+                            environ: dict[str, str],
                             toolchain_prefix: Optional[Path],
+                            sdk_prefix: Optional[Path],
+                            call_selected_meson: Callable,
                             default_library: DefaultLibrary,
-                            call_selected_meson: Callable) -> Optional[str]:
-    config = ConfigParser()
+                            outdir: Path) -> MachineConfig:
+    config = ConfigParser(dict_type=OrderedDict)
+    config["constants"] = OrderedDict()
+    config["binaries"] = OrderedDict()
+    config["built-in options"] = OrderedDict()
+    config["properties"] = OrderedDict()
+    config["host_machine"] = OrderedDict([
+        ("system", str_to_meson(machine.system)),
+        ("subsystem", str_to_meson(machine.subsystem)),
+        ("kernel", str_to_meson(machine.kernel)),
+        ("cpu_family", str_to_meson(machine.cpu_family)),
+        ("cpu", str_to_meson(machine.cpu)),
+        ("endian", str_to_meson(machine.endian)),
+    ])
 
-    config["host_machine"] = {
-        "system": str_to_meson(machine.system),
-        "subsystem": str_to_meson(machine.subsystem),
-        "kernel": str_to_meson(machine.kernel),
-        "cpu_family": str_to_meson(machine.cpu_family),
-        "cpu": str_to_meson(machine.cpu),
-        "endian": str_to_meson(machine.endian),
-    }
+    binaries = config["binaries"]
+    builtin_options = config["built-in options"]
+    properties = config["properties"]
+
+    outpath = []
+    outenv = OrderedDict()
 
     if machine.is_apple:
         impl = env_apple
@@ -149,84 +140,241 @@ def generate_machine_config(machine: MachineSpec,
     else:
         impl = env_generic
 
-    machine_path, machine_env = impl.init_machine_config(machine,
-                                                         sdk_prefix,
-                                                         native_machine,
-                                                         is_cross_build,
-                                                         call_selected_meson,
-                                                         config)
+    impl.init_machine_config(machine,
+                             build_machine,
+                             is_cross_build,
+                             environ,
+                             toolchain_prefix,
+                             sdk_prefix,
+                             call_selected_meson,
+                             config,
+                             outpath,
+                             outenv,
+                             outdir)
+
+    if machine.toolchain_is_msvc:
+        builtin_options["b_vscrt"] = str_to_meson(machine.config)
 
     if toolchain_prefix is not None:
-        binaries = config["binaries"]
-
         toolchain_bindir = toolchain_prefix / "bin"
-        exe_suffix = native_machine.executable_suffix
+        exe_suffix = build_machine.executable_suffix
+
+        ninja_binary = toolchain_bindir / f"ninja{exe_suffix}"
+        if ninja_binary.exists():
+            outenv["NINJA"] = str(ninja_binary)
 
         for (tool_name, filename_suffix) in {("gdbus-codegen", ""),
                                              ("gio-querymodules", exe_suffix),
                                              ("glib-compile-resources", exe_suffix),
                                              ("glib-compile-schemas", exe_suffix),
                                              ("glib-genmarshal", ""),
-                                             ("glib-mkenums", "")}:
+                                             ("glib-mkenums", ""),
+                                             ("flex", exe_suffix),
+                                             ("bison", exe_suffix),
+                                             ("nasm", exe_suffix)}:
             tool_path = toolchain_bindir / (tool_name + filename_suffix)
             if tool_path.exists():
+                if tool_name == "bison":
+                    outenv["BISON_PKGDATADIR"] = str(toolchain_prefix / "share" / "bison")
+                    outenv["M4"] = str(toolchain_bindir / f"m4{exe_suffix}")
+            else:
+                tool_path = shutil.which(tool_name)
+            if tool_path is not None:
                 binaries[tool_name] = strv_to_meson([str(tool_path)])
 
-        pkg_config = [
-            str(toolchain_bindir / f"pkg-config{exe_suffix}"),
-        ]
-        if default_library == "static":
-            pkg_config += ["--static"]
-        if sdk_prefix is not None:
-            pkg_config += [f"--define-variable=frida_sdk_prefix={sdk_prefix}"]
-        binaries["pkg-config"] = strv_to_meson(pkg_config)
+        pkg_config_binary = toolchain_bindir / f"pkg-config{exe_suffix}"
+        if not pkg_config_binary.exists():
+            pkg_config_binary = shutil.which("pkg-config")
+        if pkg_config_binary is not None:
+            pkg_config = [
+                str(pkg_config_binary),
+            ]
+            if default_library == "static":
+                pkg_config += ["--static"]
+            if sdk_prefix is not None:
+                pkg_config += [f"--define-variable=frida_sdk_prefix={sdk_prefix}"]
+            binaries["pkg-config"] = strv_to_meson(pkg_config)
 
-        valac_datadir = next((toolchain_prefix / "share").glob("vala-*"))
-        vala_api_version = valac_datadir.name.split("-", maxsplit=1)[1]
+        vala_compiler = detect_toolchain_vala_compiler(toolchain_prefix, build_machine)
+        if vala_compiler is not None:
+            valac, vapidir = vala_compiler
+            binaries["vala"] = strv_to_meson([
+                str(valac),
+                f"--vapidir={vapidir}",
+            ])
 
-        vapi_dirs = []
-        if sdk_prefix is not None:
-            vapi_dirs += [sdk_prefix / "share" / "vala" / "vapi"]
-        vapi_dirs += [valac_datadir / "vapi"]
-
-        valac = [
-            str(toolchain_bindir / f"valac-{vala_api_version}{exe_suffix}"),
-        ]
-        valac += [f"--vapidir={d}" for d in vapi_dirs]
-        binaries["vala"] = strv_to_meson(valac)
+    pkg_config_path = shlex.split(environ.get("PKG_CONFIG_PATH", "").replace("\\", "\\\\"))
 
     if sdk_prefix is not None:
-        libdatadir = "libdata" if machine.os == "freebsd" else "lib"
-        pkg_config_path = [str(sdk_prefix / libdatadir / "pkgconfig")]
-        config["built-in options"]["pkg_config_path"] = str_to_meson(os.pathsep.join(pkg_config_path))
+        builtin_options["vala_args"] = strv_to_meson([
+            "--vapidir=" + str(sdk_prefix / "share" / "vala" / "vapi")
+        ])
 
-    sink = io.StringIO()
-    config.write(sink)
+        pkg_config_path += [str(sdk_prefix / machine.libdatadir / "pkgconfig")]
 
-    return (sink.getvalue(), machine_path, machine_env)
+        sdk_bindir = sdk_prefix / "bin" / build_machine.os_dash_arch
+        if sdk_bindir.exists():
+            for f in sdk_bindir.iterdir():
+                binaries[f.stem] = strv_to_meson([str(f)])
+
+    builtin_options["pkg_config_path"] = strv_to_meson(pkg_config_path)
+
+    needs_wrapper = needs_exe_wrapper(build_machine, machine, environ)
+    properties["needs_exe_wrapper"] = bool_to_meson(needs_wrapper)
+    if needs_wrapper:
+        wrapper = find_exe_wrapper(machine, environ)
+        if wrapper is not None:
+            binaries["exe_wrapper"] = strv_to_meson(wrapper)
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    machine_file = outdir / f"frida-{machine.identifier}.txt"
+    with machine_file.open("w", encoding="utf-8") as f:
+        config.write(f)
+
+    return MachineConfig(machine_file, outpath, outenv)
 
 
-def query_toolchain_prefix(machine: MachineSpec, deps_dir: Path) -> Path:
-    return deps_dir / f"toolchain-{machine.identifier}"
+def needs_exe_wrapper(build_machine: MachineSpec,
+                      host_machine: MachineSpec,
+                      environ: dict[str, str]) -> bool:
+    return not can_run_host_binaries(build_machine, host_machine, environ)
 
 
-def ensure_toolchain(machine: MachineSpec, deps_dir: Path) -> Path:
-    toolchain_prefix = query_toolchain_prefix(machine, deps_dir)
-    deps.sync(deps.Bundle.TOOLCHAIN, machine, toolchain_prefix)
-    return toolchain_prefix
+def can_run_host_binaries(build_machine: MachineSpec,
+                          host_machine: MachineSpec,
+                          environ: dict[str, str]) -> bool:
+    if host_machine == build_machine:
+        return True
+
+    build_os = build_machine.os
+    build_arch = build_machine.arch
+
+    host_os = host_machine.os
+    host_arch = host_machine.arch
+
+    if host_os == build_os:
+        if build_os == "windows":
+            return True
+
+        if build_os == "macos":
+            if build_arch == "arm64" and host_arch == "x86_64":
+                return True
+
+        if build_os == "linux" and host_machine.config == build_machine.config:
+            if build_arch == "x86_64" and host_arch == "x86":
+                return True
+
+    return environ.get("FRIDA_CAN_RUN_HOST_BINARIES", "no") == "yes"
 
 
-def query_sdk_prefix(machine: MachineSpec, deps_dir: Path) -> Path:
-    if machine.os == "windows":
-        return deps_dir / "sdk-windows" / f"{machine.msvs_platform}-{machine.config.title()}"
-    return deps_dir / f"sdk-{machine.identifier}"
+def find_exe_wrapper(machine: MachineSpec,
+                     environ: dict[str, str]) -> Optional[list[str]]:
+    qemu_sysroot = environ.get("FRIDA_QEMU_SYSROOT")
+    if qemu_sysroot is None:
+        return None
+
+    qemu_flavor = "qemu-" + QEMU_ARCHS.get(machine.arch, machine.arch)
+    qemu_binary = shutil.which(qemu_flavor)
+    if qemu_binary is None:
+        raise QEMUNotFoundError(f"unable to find {qemu_flavor}, needed due to FRIDA_QEMU_SYSROOT being set")
+
+    return [qemu_binary, "-L", qemu_sysroot]
 
 
-def ensure_sdk(machine: MachineSpec, deps_dir: Path) -> Path:
-    sdk_prefix = query_sdk_prefix(machine, deps_dir)
-    if machine.os == "windows":
-        sdk_dir = sdk_prefix.parent
-    else:
-        sdk_dir = sdk_prefix
-    deps.sync(deps.Bundle.SDK, machine, sdk_dir)
-    return sdk_prefix
+def detect_toolchain_vala_compiler(toolchain_prefix: Path,
+                                   build_machine: MachineSpec) -> Optional[tuple[Path, Path]]:
+    datadir = next((toolchain_prefix / "share").glob("vala-*"), None)
+    if datadir is None:
+        return None
+
+    api_version = datadir.name.split("-", maxsplit=1)[1]
+
+    valac = toolchain_prefix / "bin" / f"valac-{api_version}{build_machine.executable_suffix}"
+    vapidir = datadir / "vapi"
+    return (valac, vapidir)
+
+
+def build_envvar_to_host(name: str) -> str:
+    if name.endswith("_FOR_BUILD"):
+        return name[:-10]
+    return name
+
+
+class QEMUNotFoundError(Exception):
+    pass
+
+
+# Based on mesonbuild/envconfig.py and mesonbuild/compilers/compilers.py
+TOOLCHAIN_ENVVARS = {
+    # Compilers
+    "CC",
+    "CXX",
+    "CSC",
+    "CYTHON",
+    "DC",
+    "FC",
+    "OBJC",
+    "OBJCXX",
+    "RUSTC",
+    "VALAC",
+    "NASM",
+
+    # Linkers
+    "CC_LD",
+    "CXX_LD",
+    "DC_LD",
+    "FC_LD",
+    "OBJC_LD",
+    "OBJCXX_LD",
+    "RUSTC_LD",
+
+    # Binutils
+    "AR",
+    "AS",
+    "LD",
+    "NM",
+    "OBJCOPY",
+    "OBJDUMP",
+    "RANLIB",
+    "READELF",
+    "SIZE",
+    "STRINGS",
+    "STRIP",
+    "WINDRES",
+
+    # Other tools
+    "CMAKE",
+    "QMAKE",
+    "PKG_CONFIG",
+    "PKG_CONFIG_PATH",
+    "MAKE",
+    "VAPIGEN",
+    "LLVM_CONFIG",
+
+    # Deprecated
+    "D_LD",
+    "F_LD",
+    "RUST_LD",
+    "OBJCPP_LD",
+
+    # Flags
+    "CFLAGS",
+    "CXXFLAGS",
+    "CUFLAGS",
+    "OBJCFLAGS",
+    "OBJCXXFLAGS",
+    "FFLAGS",
+    "DFLAGS",
+    "VALAFLAGS",
+    "RUSTFLAGS",
+    "CYTHONFLAGS",
+    "CSFLAGS",
+    "LDFLAGS",
+}
+
+QEMU_ARCHS = {
+    "armeabi": "arm",
+    "armhf": "arm",
+    "armbe8": "armeb",
+    "arm64": "aarch64",
+}

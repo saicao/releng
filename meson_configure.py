@@ -1,21 +1,35 @@
 import argparse
-import json
 import os
 from pathlib import Path
+import pickle
 import platform
 import re
 import shlex
 import shutil
+import subprocess
 import sys
+from typing import Any, Callable, List, Optional, Sequence
 
-from . import deps, env, machine_spec
+sys.path.insert(0, str(Path(__file__).parent / "meson"))
+import mesonbuild.interpreter
+from mesonbuild.coredata import UserArrayOption, UserBooleanOption, \
+        UserComboOption, UserFeatureOption, UserOption, UserStringOption
 
-OPTION_DEFS_PATTERN = re.compile(r"\boption\s*\(\s*'([^']+)'.*?,(.+?)\)", re.DOTALL)
-OPTION_PROP_KEYS_PATTERN = re.compile(r"\b(\w+)\s*:")
+from . import deps, env
+from .machine_spec import MachineSpec
+from .progress import ProgressCallback, print_progress
 
 
 def main():
-    project_srcroot = Path(sys.argv.pop(1)).resolve()
+    default_sourcedir = Path(sys.argv.pop(1))
+    sourcedir = Path(os.environ.get("FRIDA_SOURCEDIR", default_sourcedir)).resolve()
+
+    workdir = Path(os.getcwd())
+    if workdir.is_relative_to(sourcedir):
+        default_builddir = sourcedir / "build"
+    else:
+        default_builddir = workdir
+    builddir = Path(os.environ.get("FRIDA_BUILDDIR", default_builddir)).resolve()
 
     parser = argparse.ArgumentParser(prog="configure",
                                      add_help=False)
@@ -30,11 +44,14 @@ def main():
     opts.add_argument("--build",
                       help="configure for building on BUILD",
                       metavar="BUILD",
-                      type=machine_spec.parse)
+                      type=MachineSpec.parse)
     opts.add_argument("--host",
                       help="cross-compile to build binaries to run on HOST",
                       metavar="HOST",
-                      type=machine_spec.parse)
+                      type=MachineSpec.parse)
+    opts.add_argument("--enable-symbols",
+                      help="build binaries with debug symbols included (default: disabled)",
+                      action="store_true")
     opts.add_argument("--enable-shared",
                       help="enable building shared libraries (default: disabled)",
                       action="store_true")
@@ -52,101 +69,117 @@ def main():
                       nargs="*",
                       help=argparse.SUPPRESS)
 
-    meson_options_file = project_srcroot / "meson.options"
+    meson_options_file = sourcedir / "meson.options"
     if not meson_options_file.exists():
-        meson_options_file = project_srcroot / "meson_options.txt"
+        meson_options_file = sourcedir / "meson_options.txt"
     if meson_options_file.exists():
         meson_group = parser.add_argument_group(title="project-specific options")
-        meson_opts = register_meson_options(meson_options_file.read_text(encoding="utf-8"), meson_group)
+        meson_opts = register_meson_options(meson_options_file, meson_group)
 
     options = parser.parse_args()
 
-    work_dir = Path(os.getcwd())
-    if work_dir.is_relative_to(project_srcroot):
-        build_dir = project_srcroot / "build"
-    else:
-        build_dir = work_dir
-    if build_dir.exists():
-        if (build_dir / "build.ninja").exists():
-            print(f"Already configured. Wipe .{os.sep}{build_dir.relative_to(work_dir)} to reconfigure.",
+    if builddir.exists():
+        if (builddir / "build.ninja").exists():
+            print(f"Already configured. Wipe .{os.sep}{builddir.relative_to(workdir)} to reconfigure.",
                   file=sys.stderr)
             sys.exit(1)
-        for item in build_dir.iterdir():
-            shutil.rmtree(item, ignore_errors=True)
 
     default_library = "shared" if options.enable_shared else "static"
 
     allowed_prebuilds = set(query_supported_bundle_types(include_wildcards=False)) - options.without_prebuilds
 
-    exit_status = configure(project_srcroot,
-                            build_dir,
-                            options.prefix,
-                            options.build,
-                            options.host,
-                            default_library,
-                            allowed_prebuilds,
-                            options.meson,
-                            collect_meson_options(options))
+    try:
+        configure(sourcedir,
+                  builddir,
+                  options.prefix,
+                  options.build,
+                  options.host,
+                  os.environ,
+                  default_library,
+                  allowed_prebuilds,
+                  options.meson,
+                  collect_meson_options(options))
+    except Exception as e:
+        print(e, file=sys.stderr)
+        if isinstance(e, subprocess.CalledProcessError):
+            for label, data in [("Output", e.output),
+                                ("Stderr", e.stderr)]:
+                if data:
+                    print(f"{label}:\n\t| " + "\n\t| ".join(data.strip().split("\n")), file=sys.stderr)
+        sys.exit(1)
 
-    sys.exit(exit_status)
 
-
-def configure(project_srcroot,
-              build_dir,
-              prefix=None,
-              build_machine=None,
-              host_machine=None,
-              default_library="static",
-              allowed_prebuilds=None,
-              meson="internal",
-              extra_meson_options=[]):
+def configure(sourcedir: Path,
+              builddir: Path,
+              prefix: Optional[str] = None,
+              build_machine: Optional[MachineSpec] = None,
+              host_machine: Optional[MachineSpec] = None,
+              environ: dict[str, str] = os.environ,
+              default_library: str = "static",
+              allowed_prebuilds: Sequence[str] = None,
+              meson: str = "internal",
+              extra_meson_options: List[str] = [],
+              call_meson: Callable = env.call_meson,
+              on_progress: ProgressCallback = print_progress):
     if prefix is None:
-        prefix = env.detect_native_default_prefix()
+        prefix = env.detect_default_prefix()
+
+    project_vscrt = detect_project_vscrt(sourcedir)
 
     if build_machine is None:
-        build_machine = env.detect_native_machine()
+        build_machine = MachineSpec.make_from_local_system()
+    build_machine = build_machine.default_missing(recommended_vscrt=project_vscrt)
 
     if host_machine is None:
         host_machine = build_machine
+    else:
+        host_machine = host_machine.default_missing(recommended_vscrt=project_vscrt)
 
     if host_machine.os == "windows":
-        vs_arch = os.environ.get("VSCMD_ARG_TGT_ARCH", None)
+        vs_arch = environ.get("VSCMD_ARG_TGT_ARCH")
         if vs_arch == "x86":
-            host_machine = machine_spec.MachineSpec("windows", "x86", host_machine.config)
-        if build_machine.os == "windows" and build_machine.arch == "x86_64" and host_machine.arch == "x86":
-            build_machine = host_machine
+            host_machine = host_machine.evolve(arch=vs_arch)
+
+    build_machine = build_machine.maybe_adapt_to_host(host_machine)
 
     if allowed_prebuilds is None:
         allowed_prebuilds = set(query_supported_bundle_types(include_wildcards=False))
 
-    meson_options = [
-        f"--prefix={prefix}",
-        f"--default-library={default_library}",
-        "-Doptimization=s",
-        "-Db_vscrt=mt",
-    ]
-    extra_paths = []
+    call_selected_meson = lambda argv, *args, **kwargs: call_meson(argv,
+                                                                   use_submodule=meson == "internal",
+                                                                   *args,
+                                                                   **kwargs)
 
-    if len(allowed_prebuilds) != 0:
-        raw_deps_dir = os.environ.get("FRIDA_DEPS", None)
-        if raw_deps_dir is not None:
-            deps_dir = Path(raw_deps_dir)
-        else:
-            deps_dir = project_srcroot / "deps"
+    meson_options = [
+        f"-Dprefix={prefix}",
+        f"-Ddefault_library={default_library}",
+        *host_machine.meson_optimization_options,
+    ]
+
+    deps_dir = deps.detect_cache_dir(sourcedir)
 
     allow_prebuilt_toolchain = "toolchain" in allowed_prebuilds
     if allow_prebuilt_toolchain:
         try:
-            toolchain_prefix = env.ensure_toolchain(build_machine, deps_dir)
+            toolchain_prefix, _ = deps.ensure_toolchain(build_machine, deps_dir, on_progress=on_progress)
         except deps.BundleNotFoundError as e:
-            print_toolchain_not_found_error(e)
-            return 1
-        except Exception as e:
-            print_toolchain_unknown_error(e)
-            return 2
-        extra_paths += [toolchain_prefix / "bin"]
+            raise ToolchainNotFoundError("\n".join([
+                f"Unable to download toolchain: {e}",
+                "Specify --without-prebuilds=toolchain to only use tools on your PATH.",
+            ]))
     else:
-        toolchain_prefix = None
+        if project_depends_on_vala_compiler(sourcedir):
+            toolchain_prefix = deps.query_toolchain_prefix(build_machine, deps_dir)
+            vala_compiler = env.detect_toolchain_vala_compiler(toolchain_prefix, build_machine)
+            if vala_compiler is None:
+                try:
+                    build_vala_compiler(toolchain_prefix, deps_dir, call_selected_meson)
+                except subprocess.CalledProcessError as e:
+                    print(e, file=sys.stderr)
+                    print("Output:\n\t| " + "\n\t| ".join(e.output.strip().split("\n")), file=sys.stderr)
+                    return 70
+        else:
+            toolchain_prefix = None
 
     is_cross_build = host_machine != build_machine
 
@@ -156,105 +189,76 @@ def configure(project_srcroot,
         required.add("sdk:host")
     if allowed_prebuilds.issuperset(required):
         try:
-            build_sdk_prefix = env.ensure_sdk(build_machine, deps_dir)
+            build_sdk_prefix, _ = deps.ensure_sdk(build_machine, deps_dir, on_progress=on_progress)
         except deps.BundleNotFoundError as e:
-            print_sdk_not_found_error(e)
-            return 3
-        except Exception as e:
-            print_sdk_unknown_error(e)
-            return 4
+            raise SDKNotFoundError("\n".join([
+                f"Unable to download SDK: {e}",
+                "Specify --without-prebuilds=sdk:build to build dependencies from source code.",
+            ]))
 
     host_sdk_prefix = None
     if is_cross_build and "sdk:host" in allowed_prebuilds:
         try:
-            host_sdk_prefix = env.ensure_sdk(host_machine, deps_dir)
+            host_sdk_prefix, _ = deps.ensure_sdk(host_machine, deps_dir, on_progress=on_progress)
         except deps.BundleNotFoundError as e:
-            print_sdk_not_found_error(e)
-            return 5
-        except Exception as e:
-            print_sdk_unknown_error(e)
-            return 6
+            raise SDKNotFoundError("\n".join([
+                f"Unable to download SDK: {e}",
+                "Specify --without-prebuilds=sdk:host to build dependencies from source code.",
+            ]))
 
-    if "sdk:build" in allowed_prebuilds and "sdk:host" in allowed_prebuilds:
-        meson_options += ["-Dwrap_mode=nofallback"]
+    build_config, host_config = \
+            env.generate_machine_configs(build_machine,
+                                         host_machine,
+                                         environ,
+                                         toolchain_prefix,
+                                         build_sdk_prefix,
+                                         host_sdk_prefix,
+                                         call_selected_meson,
+                                         default_library,
+                                         builddir)
 
-    call_selected_meson = lambda argv, *args, **kwargs: env.call_meson(argv,
-                                                                       use_submodule=meson == "internal",
-                                                                       *args, **kwargs)
-    try:
-        native_file, cross_file, machine_paths, machine_env = \
-                env.generate_machine_files(build_machine, build_sdk_prefix,
-                                           host_machine, host_sdk_prefix,
-                                           toolchain_prefix, default_library,
-                                           call_selected_meson, build_dir)
-    except Exception as e:
-        print(f"Unable to generate machine files: {e}", file=sys.stderr)
-        return 7
-    meson_options += [f"--native-file={native_file}"]
-    if cross_file is not None:
-        meson_options += [f"--cross-file={cross_file}"]
-    extra_paths += machine_paths
+    meson_options += [f"--native-file={build_config.machine_file}"]
+    if host_config is not build_config:
+        meson_options += [f"--cross-file={host_config.machine_file}"]
 
-    raw_extra_paths = [str(p) for p in extra_paths]
+    call_selected_meson(["setup"] + meson_options + extra_meson_options + [builddir],
+                        cwd=sourcedir,
+                        env=host_config.make_merged_environment(environ),
+                        check=True)
 
-    meson_env = {**os.environ, **machine_env}
-    meson_env["PATH"] = os.pathsep.join(raw_extra_paths) + os.pathsep + meson_env["PATH"]
-
-    process = call_selected_meson(["setup"] + meson_options + extra_meson_options + [build_dir],
-                                  cwd=project_srcroot,
-                                  env=meson_env)
-
-    makefile_path = build_dir / "Makefile"
+    makefile_path = builddir / "Makefile"
     if not makefile_path.exists():
-        in_tree = (project_srcroot / "Makefile").read_text(encoding="utf-8")
+        in_tree = (sourcedir / "Makefile").read_text(encoding="utf-8")
         out_of_tree = in_tree \
-                .replace('"$(shell pwd)"', shlex.quote(str(project_srcroot))) \
-                .replace('./build', ".")
+                .replace('"$(shell pwd)"', shlex.quote(str(sourcedir))) \
+                .replace("./build", ".") \
+                .replace("releng/meson/meson.py",
+                         shlex.quote(str(sourcedir / "releng" / "meson" / "meson.py")))
         makefile_path.write_text(out_of_tree)
 
         if platform.system() == "Windows":
-            in_tree = (project_srcroot / "make.bat").read_text(encoding="utf-8")
+            in_tree = (sourcedir / "make.bat").read_text(encoding="utf-8")
             out_of_tree = in_tree \
-                    .replace('"%dp0%"', '"' + str(project_srcroot) + '"') \
+                    .replace('"%dp0%"', '"' + str(sourcedir) + '"') \
                     .replace('.\\build', ".")
-            (build_dir / "make.bat").write_text(out_of_tree)
+            (builddir / "make.bat").write_text(out_of_tree)
 
-    env_config = {
+    (builddir / "frida-env.dat").write_bytes(pickle.dumps({
         "meson": meson,
-        "paths": raw_extra_paths,
-        "env": machine_env,
-    }
-    (build_dir / "frida-env-config.json").write_text(json.dumps(env_config, indent=2), encoding="utf-8")
-
-    return process.returncode
+        "build": build_config,
+        "host": host_config if host_config is not build_config else None,
+        "deps": deps_dir,
+    }))
 
 
-def print_toolchain_not_found_error(e):
-    print(f"Unable to download toolchain: {e}", file=sys.stderr)
-    print(f"Specify --without-prebuilds=toolchain to only use tools on your PATH.", file=sys.stderr)
-
-
-def print_toolchain_unknown_error(e):
-    print(f"Unable to prepare toolchain: {e}", file=sys.stderr)
-
-
-def print_sdk_not_found_error(e):
-    print(f"Unable to download SDK: {e}", file=sys.stderr)
-    print(f"Specify --without-prebuilds=sdk[:{{build|host}}] to build dependencies from source code.", file=sys.stderr)
-
-
-def print_sdk_unknown_error(e):
-    print(f"Unable to prepare SDK: {e}", file=sys.stderr)
-
-
-def parse_prefix(raw_prefix):
+def parse_prefix(raw_prefix: str) -> Path:
     prefix = Path(raw_prefix)
     if not prefix.is_absolute():
         prefix = Path(os.getcwd()) / prefix
     return prefix
 
 
-def query_supported_bundle_types(include_wildcards):
+def query_supported_bundle_types(include_wildcards: bool) -> List[str]:
     for e in deps.Bundle:
         identifier = e.name.lower()
         if e == deps.Bundle.SDK:
@@ -266,11 +270,11 @@ def query_supported_bundle_types(include_wildcards):
             yield identifier
 
 
-def query_supported_bundle_type_values():
+def query_supported_bundle_type_values() -> List[deps.Bundle]:
     return [e for e in deps.Bundle]
 
 
-def parse_bundle_type_set(raw_array):
+def parse_bundle_type_set(raw_array: str) -> List[str]:
     supported_types = list(query_supported_bundle_types(include_wildcards=True))
     result = set()
     for element in raw_array.split(","):
@@ -286,95 +290,105 @@ def parse_bundle_type_set(raw_array):
     return result
 
 
-def register_meson_options(meson_option_defs, group):
-    hidden_constants = {
-        "true": True,
-        "false": False,
-    }
+def register_meson_options(meson_option_file: Path, group: argparse._ArgumentGroup):
+    interpreter = mesonbuild.optinterpreter.OptionInterpreter(subproject="")
+    interpreter.process(meson_option_file)
 
-    for match in OPTION_DEFS_PATTERN.finditer(meson_option_defs):
-        name = match.group(1)
+    for key, opt in interpreter.options.items():
+        name = key.name
         pretty_name = name.replace("_", "-")
 
-        raw_spec = OPTION_PROP_KEYS_PATTERN.sub(lambda m: '"' + m.group(1) + '":', match.group(2)) \
-                .replace("\n", " ")
-        spec = eval("{" + raw_spec + "}", hidden_constants)
-
-        option_type = spec["type"]
-        if option_type in {"boolean", "feature"}:
-            default_value = spec.get("value", None)
-
-            if option_type == "boolean":
-                value_when_enabled = "true"
-                value_when_disabled = "false"
-            else:
-                value_when_enabled = "enabled"
-                value_when_disabled = "disabled"
-
-            if default_value != value_when_enabled:
+        if isinstance(opt, UserFeatureOption):
+            if opt.value != "enabled":
                 action = "enable"
-                value_to_set = value_when_enabled
+                value_to_set = "enabled"
             else:
                 action = "disable"
-                value_to_set = value_when_disabled
-
+                value_to_set = "disabled"
             group.add_argument(f"--{action}-{pretty_name}",
                                action="append_const",
                                const=f"-D{name}={value_to_set}",
                                dest="main_meson_options",
-                               **parse_option_meta(name, spec))
-        elif option_type == "combo":
+                               **parse_option_meta(name, action, opt))
+            if opt.value == "auto":
+                group.add_argument(f"--disable-{pretty_name}",
+                                   action="append_const",
+                                   const=f"-D{name}=disabled",
+                                   dest="main_meson_options",
+                                   **parse_option_meta(name, "disable", opt))
+        elif isinstance(opt, UserBooleanOption):
+            if not opt.value:
+                action = "enable"
+                value_to_set = "true"
+            else:
+                action = "disable"
+                value_to_set = "false"
+            group.add_argument(f"--{action}-{pretty_name}",
+                               action="append_const",
+                               const=f"-D{name}={value_to_set}",
+                               dest="main_meson_options",
+                               **parse_option_meta(name, action, opt))
+        elif isinstance(opt, UserComboOption):
             group.add_argument(f"--with-{pretty_name}",
-                               choices=spec["choices"],
+                               choices=opt.choices,
                                dest="meson_option:" + name,
-                               **parse_option_meta(name, spec))
-        elif option_type == "array":
+                               **parse_option_meta(name, "with", opt))
+        elif isinstance(opt, UserArrayOption):
             group.add_argument(f"--with-{pretty_name}",
                                dest="meson_option:" + name,
-                               type=make_array_option_value_parser(spec),
-                               **parse_option_meta(name, spec))
+                               type=make_array_option_value_parser(opt),
+                               **parse_option_meta(name, "with", opt))
         else:
             group.add_argument(f"--with-{pretty_name}",
                                dest="meson_option:" + name,
-                               **parse_option_meta(name, spec))
+                               **parse_option_meta(name, "with", opt))
 
 
-def parse_option_meta(name, spec):
+def parse_option_meta(name: str,
+                      action: str,
+                      opt: UserOption[Any]):
     params = {}
 
-    otype = spec["type"]
-
-    desc = spec.get("description", None)
-    if desc is not None:
-        val = spec.get("value", None)
-        if val is None:
-            if otype == "string":
-                val = ""
-            elif otype == "boolean":
-                val = True
-            elif otype == "combo":
-                val = spec["choices"][0]
-            elif otype == "integer":
-                val = 0
-            elif otype == "array":
-                val = []
-            elif otype == "feature":
-                val = "auto"
-        params["help"] = f"{desc} (default: {str(val).lower()})"
-
-    choices = spec.get("choices", None)
-    if choices is not None:
-        delimiter = "|" if otype == "combo" else ","
-        metavar = "{" + delimiter.join(choices) + "}"
-    else:
+    if isinstance(opt, UserStringOption):
+        default_value = repr(opt.value)
         metavar = name.upper()
+    elif isinstance(opt, UserArrayOption):
+        default_value = ",".join(opt.value)
+        metavar = "{" + ",".join(opt.choices) + "}"
+    elif isinstance(opt, UserComboOption):
+        default_value = opt.value
+        metavar = "{" + "|".join(opt.choices) + "}"
+    else:
+        default_value = str(opt.value).lower()
+        metavar = name.upper()
+
+    if not (isinstance(opt, UserFeatureOption) \
+            and opt.value == "auto" \
+            and action == "disable"):
+        text = f"{help_text_from_meson(opt.description)} (default: {default_value})"
+        if action == "disable":
+            text = "do not " + text
+        params["help"] = text
     params["metavar"] = metavar
 
     return params
 
 
-def collect_meson_options(options):
+def help_text_from_meson(description: str) -> str:
+    if description:
+        return description[0].lower() + description[1:]
+    return description
+
+
+def collect_meson_options(options: argparse.Namespace) -> List[str]:
     result = []
+
+    if not options.enable_symbols:
+        machine = options.host
+        if machine is None:
+            machine = MachineSpec.make_from_local_system()
+        if machine.toolchain_can_strip:
+            result += ["-Dstrip=true"]
 
     for raw_name, raw_val in vars(options).items():
         if raw_val is None:
@@ -391,18 +405,77 @@ def collect_meson_options(options):
     return result
 
 
-def make_array_option_value_parser(option_spec):
-    return lambda v: parse_array_option_value(v, option_spec)
+def make_array_option_value_parser(opt: UserOption[Any]) -> Callable[[str], List[str]]:
+    return lambda v: parse_array_option_value(v, opt)
 
 
-def parse_array_option_value(v, option_spec):
+def parse_array_option_value(v: str, opt: UserArrayOption) -> List[str]:
     vals = [v.strip() for v in v.split(",")]
 
-    choices = option_spec.get("choices", None)
-    if choices is not None:
-        for v in vals:
-            if v not in choices:
-                pretty_choices = "', '".join(choices)
-                raise argparse.ArgumentTypeError(f"invalid array value: '{v}' (choose from '{pretty_choices}')")
+    choices = opt.choices
+    for v in vals:
+        if v not in choices:
+            pretty_choices = "', '".join(choices)
+            raise argparse.ArgumentTypeError(f"invalid array value: '{v}' (choose from '{pretty_choices}')")
 
     return vals
+
+
+def detect_project_vscrt(sourcedir: Path) -> Optional[str]:
+    m = next(re.finditer(r"project\(([^)]+\))", read_meson_build(sourcedir)), None)
+    if m is not None:
+        project_args = m.group(1)
+        m = next(re.finditer("'b_vscrt=([^']+)'", project_args), None)
+        if m is not None:
+            return m.group(1)
+    return None
+
+
+def project_depends_on_vala_compiler(sourcedir: Path) -> bool:
+    return "'vala'" in read_meson_build(sourcedir)
+
+
+def read_meson_build(sourcedir: Path) -> str:
+    return (sourcedir / "meson.build").read_text(encoding="utf-8")
+
+
+def build_vala_compiler(toolchain_prefix: Path, deps_dir: Path, call_selected_meson: Callable):
+    print("Building Vala compiler...", flush=True)
+
+    workdir = deps_dir / "src"
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    run_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "encoding": "utf-8",
+        "check": True,
+    }
+
+    vala_checkout = workdir / "vala"
+    if vala_checkout.exists():
+        shutil.rmtree(vala_checkout)
+    subprocess.run(["git", "clone", "--depth", "1", "https://github.com/frida/vala.git", vala_checkout.name],
+                   cwd=vala_checkout.parent,
+                   **run_kwargs)
+
+    call_selected_meson([
+                            "setup",
+                            f"--prefix={toolchain_prefix}",
+                            "-Doptimization=2",
+                            "build",
+                        ],
+                        cwd=vala_checkout,
+                        **run_kwargs)
+
+    call_selected_meson(["install"],
+                        cwd=vala_checkout / "build",
+                        **run_kwargs)
+
+
+class ToolchainNotFoundError(Exception):
+    pass
+
+
+class SDKNotFoundError(Exception):
+    pass
