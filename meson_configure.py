@@ -8,9 +8,12 @@ import shlex
 import shutil
 import subprocess
 import sys
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Set
 
-sys.path.insert(0, str(Path(__file__).parent / "meson"))
+RELENG_DIR = Path(__file__).resolve().parent
+SCRIPTS_DIR = RELENG_DIR / "meson-scripts"
+
+sys.path.insert(0, str(RELENG_DIR / "meson"))
 import mesonbuild.interpreter
 from mesonbuild.coredata import UserArrayOption, UserBooleanOption, \
         UserComboOption, UserFeatureOption, UserOption, UserStringOption
@@ -22,17 +25,18 @@ from .progress import ProgressCallback, print_progress
 
 def main():
     default_sourcedir = Path(sys.argv.pop(1))
-    sourcedir = Path(os.environ.get("FRIDA_SOURCEDIR", default_sourcedir)).resolve()
+    sourcedir = Path(os.environ.get("MESON_SOURCE_ROOT", default_sourcedir)).resolve()
 
     workdir = Path(os.getcwd())
-    if workdir.is_relative_to(sourcedir):
+    if workdir == sourcedir:
         default_builddir = sourcedir / "build"
     else:
         default_builddir = workdir
-    builddir = Path(os.environ.get("FRIDA_BUILDDIR", default_builddir)).resolve()
+    builddir = Path(os.environ.get("MESON_BUILD_ROOT", default_builddir)).resolve()
 
     parser = argparse.ArgumentParser(prog="configure",
-                                     add_help=False)
+                                     add_help=False,
+                                     formatter_class=argparse.RawTextHelpFormatter)
     opts = parser.add_argument_group(title="generic options")
     opts.add_argument("-h", "--help",
                       help="show this help message and exit",
@@ -95,6 +99,7 @@ def main():
                   options.build,
                   options.host,
                   os.environ,
+                  "included" if options.enable_symbols else "stripped",
                   default_library,
                   allowed_prebuilds,
                   options.meson,
@@ -114,9 +119,10 @@ def configure(sourcedir: Path,
               prefix: Optional[str] = None,
               build_machine: Optional[MachineSpec] = None,
               host_machine: Optional[MachineSpec] = None,
-              environ: dict[str, str] = os.environ,
+              environ: Dict[str, str] = os.environ,
+              debug_symbols: str = "stripped",
               default_library: str = "static",
-              allowed_prebuilds: Sequence[str] = None,
+              allowed_prebuilds: Set[str] = None,
               meson: str = "internal",
               extra_meson_options: List[str] = [],
               call_meson: Callable = env.call_meson,
@@ -155,6 +161,8 @@ def configure(sourcedir: Path,
         f"-Ddefault_library={default_library}",
         *host_machine.meson_optimization_options,
     ]
+    if debug_symbols == "stripped" and host_machine.toolchain_can_strip:
+        meson_options += ["-Dstrip=true"]
 
     deps_dir = deps.detect_cache_dir(sourcedir)
 
@@ -163,21 +171,13 @@ def configure(sourcedir: Path,
         try:
             toolchain_prefix, _ = deps.ensure_toolchain(build_machine, deps_dir, on_progress=on_progress)
         except deps.BundleNotFoundError as e:
-            raise ToolchainNotFoundError("\n".join([
-                f"Unable to download toolchain: {e}",
-                "Specify --without-prebuilds=toolchain to only use tools on your PATH.",
-            ]))
+            raise_toolchain_not_found(e)
     else:
         if project_depends_on_vala_compiler(sourcedir):
             toolchain_prefix = deps.query_toolchain_prefix(build_machine, deps_dir)
             vala_compiler = env.detect_toolchain_vala_compiler(toolchain_prefix, build_machine)
             if vala_compiler is None:
-                try:
-                    build_vala_compiler(toolchain_prefix, deps_dir, call_selected_meson)
-                except subprocess.CalledProcessError as e:
-                    print(e, file=sys.stderr)
-                    print("Output:\n\t| " + "\n\t| ".join(e.output.strip().split("\n")), file=sys.stderr)
-                    return 70
+                build_vala_compiler(toolchain_prefix, deps_dir, call_selected_meson)
         else:
             toolchain_prefix = None
 
@@ -191,20 +191,14 @@ def configure(sourcedir: Path,
         try:
             build_sdk_prefix, _ = deps.ensure_sdk(build_machine, deps_dir, on_progress=on_progress)
         except deps.BundleNotFoundError as e:
-            raise SDKNotFoundError("\n".join([
-                f"Unable to download SDK: {e}",
-                "Specify --without-prebuilds=sdk:build to build dependencies from source code.",
-            ]))
+            raise_sdk_not_found(e, "build", build_machine)
 
     host_sdk_prefix = None
     if is_cross_build and "sdk:host" in allowed_prebuilds:
         try:
             host_sdk_prefix, _ = deps.ensure_sdk(host_machine, deps_dir, on_progress=on_progress)
         except deps.BundleNotFoundError as e:
-            raise SDKNotFoundError("\n".join([
-                f"Unable to download SDK: {e}",
-                "Specify --without-prebuilds=sdk:host to build dependencies from source code.",
-            ]))
+            raise_sdk_not_found(e, "host", host_machine)
 
     build_config, host_config = \
             env.generate_machine_configs(build_machine,
@@ -221,32 +215,24 @@ def configure(sourcedir: Path,
     if host_config is not build_config:
         meson_options += [f"--cross-file={host_config.machine_file}"]
 
+    setup_env = host_config.make_merged_environment(environ)
+    setup_env["FRIDA_ALLOWED_PREBUILDS"] = ",".join(allowed_prebuilds)
+
     call_selected_meson(["setup"] + meson_options + extra_meson_options + [builddir],
                         cwd=sourcedir,
-                        env=host_config.make_merged_environment(environ),
+                        env=setup_env,
                         check=True)
 
-    makefile_path = builddir / "Makefile"
-    if not makefile_path.exists():
-        in_tree = (sourcedir / "Makefile").read_text(encoding="utf-8")
-        out_of_tree = in_tree \
-                .replace('"$(shell pwd)"', shlex.quote(str(sourcedir))) \
-                .replace("./build", ".") \
-                .replace("releng/meson/meson.py",
-                         shlex.quote(str(sourcedir / "releng" / "meson" / "meson.py")))
-        makefile_path.write_text(out_of_tree)
-
-        if platform.system() == "Windows":
-            in_tree = (sourcedir / "make.bat").read_text(encoding="utf-8")
-            out_of_tree = in_tree \
-                    .replace('"%dp0%"', '"' + str(sourcedir) + '"') \
-                    .replace('.\\build', ".")
-            (builddir / "make.bat").write_text(out_of_tree)
+    shutil.copy(SCRIPTS_DIR / "BSDmakefile", builddir)
+    (builddir / "Makefile").write_text(generate_out_of_tree_makefile(sourcedir), encoding="utf-8")
+    if platform.system() == "Windows":
+        (builddir / "make.bat").write_text(generate_out_of_tree_make_bat(sourcedir), encoding="utf-8")
 
     (builddir / "frida-env.dat").write_bytes(pickle.dumps({
         "meson": meson,
         "build": build_config,
         "host": host_config if host_config is not build_config else None,
+        "allowed_prebuilds": allowed_prebuilds,
         "deps": deps_dir,
     }))
 
@@ -288,6 +274,52 @@ def parse_bundle_type_set(raw_array: str) -> List[str]:
         else:
             result.add(bundle_type)
     return result
+
+
+def raise_toolchain_not_found(e: Exception):
+    raise ToolchainNotFoundError("\n".join([
+        f"Unable to download toolchain: {e}",
+        "",
+        "Specify --without-prebuilds=toolchain to only use tools on your PATH.",
+        "",
+        "Another option is to do what Frida's CI does:",
+        "",
+        "    ./releng/deps.py build --bundle=toolchain",
+        "",
+        "This produces a tarball in ./deps which gets picked up if you retry `./configure`.",
+        "You may also want to make a backup of it for future reuse.",
+    ]))
+
+
+def raise_sdk_not_found(e: Exception, kind: str, machine: MachineSpec):
+    raise SDKNotFoundError("\n".join([
+        f"Unable to download SDK: {e}",
+        "",
+        f"Specify --without-prebuilds=sdk:{kind} to build dependencies from source code.",
+        "",
+        "Another option is to do what Frida's CI does:",
+        "",
+        f"    ./releng/deps.py build --bundle=sdk --host={machine.identifier}",
+        "",
+        "This produces a tarball in ./deps which gets picked up if you retry `./configure`.",
+        "You may also want to make a backup of it for future reuse.",
+    ]))
+
+
+def generate_out_of_tree_makefile(sourcedir: Path) -> str:
+    m = ((SCRIPTS_DIR / "Makefile").read_text(encoding="utf-8")
+            .replace("sys.argv[1]", "r'" + str(RELENG_DIR.parent) + "'")
+            .replace('"$(shell pwd)"', shlex.quote(str(sourcedir)))
+            .replace("./build", "."))
+    return re.sub(r"git-submodules:.+?(?=\.PHONY:)", "", m, flags=re.MULTILINE | re.DOTALL)
+
+
+def generate_out_of_tree_make_bat(sourcedir: Path) -> str:
+    m = ((SCRIPTS_DIR / "make.bat").read_text(encoding="utf-8")
+            .replace("sys.argv[1]", "r'" + str(RELENG_DIR.parent) + "'")
+            .replace('"%dp0%"', '"' + str(sourcedir) + '"')
+            .replace('.\\build', "\"%dp0%\""))
+    return re.sub(r"if not exist .+?(?=endlocal)", "", m, flags=re.MULTILINE | re.DOTALL)
 
 
 def register_meson_options(meson_option_file: Path, group: argparse._ArgumentGroup):
@@ -383,13 +415,6 @@ def help_text_from_meson(description: str) -> str:
 def collect_meson_options(options: argparse.Namespace) -> List[str]:
     result = []
 
-    if not options.enable_symbols:
-        machine = options.host
-        if machine is None:
-            machine = MachineSpec.make_from_local_system()
-        if machine.toolchain_can_strip:
-            result += ["-Dstrip=true"]
-
     for raw_name, raw_val in vars(options).items():
         if raw_val is None:
             continue
@@ -445,20 +470,22 @@ def build_vala_compiler(toolchain_prefix: Path, deps_dir: Path, call_selected_me
     workdir = deps_dir / "src"
     workdir.mkdir(parents=True, exist_ok=True)
 
+    git = lambda *args, **kwargs: subprocess.run(["git", *args],
+                                                 **kwargs,
+                                                 capture_output=True,
+                                                 encoding="utf-8")
+    vala_checkout = workdir / "vala"
+    if vala_checkout.exists():
+        shutil.rmtree(vala_checkout)
+    vala_pkg = deps.load_dependency_parameters().packages["vala"]
+    deps.clone_shallow(vala_pkg, vala_checkout, git)
+
     run_kwargs = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
         "encoding": "utf-8",
         "check": True,
     }
-
-    vala_checkout = workdir / "vala"
-    if vala_checkout.exists():
-        shutil.rmtree(vala_checkout)
-    subprocess.run(["git", "clone", "--depth", "1", "https://github.com/frida/vala.git", vala_checkout.name],
-                   cwd=vala_checkout.parent,
-                   **run_kwargs)
-
     call_selected_meson([
                             "setup",
                             f"--prefix={toolchain_prefix}",
@@ -467,7 +494,6 @@ def build_vala_compiler(toolchain_prefix: Path, deps_dir: Path, call_selected_me
                         ],
                         cwd=vala_checkout,
                         **run_kwargs)
-
     call_selected_meson(["install"],
                         cwd=vala_checkout / "build",
                         **run_kwargs)

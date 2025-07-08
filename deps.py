@@ -19,10 +19,10 @@ import sys
 import tarfile
 import tempfile
 import time
-from typing import Callable, Iterator, Optional, Mapping, Sequence, Union
+from typing import Callable, Dict, Iterator, List, Optional, Mapping, Sequence, Set, Tuple, Union
 import urllib.request
 
-RELENG_DIR = Path(__file__).parent.resolve()
+RELENG_DIR = Path(__file__).resolve().parent
 ROOT_DIR = RELENG_DIR.parent
 
 if __name__ == "__main__":
@@ -47,38 +47,41 @@ def main():
         "help": "bundle (default: sdk)",
         "type": parse_bundle_option_value,
     }
-    host_opt_kwargs = {
+    machine_opt_kwargs = {
         "help": f"os/arch (default: {default_machine})",
         "type": MachineSpec.parse,
     }
 
     command = subparsers.add_parser("sync", help="ensure prebuilt dependencies are up-to-date")
     command.add_argument("bundle", **bundle_opt_kwargs)
-    command.add_argument("host", **host_opt_kwargs)
+    command.add_argument("host", **machine_opt_kwargs)
     command.add_argument("location", help="filesystem location", type=Path)
     command.set_defaults(func=lambda args: sync(args.bundle, args.host, args.location.resolve()))
 
     command = subparsers.add_parser("roll", help="build and upload prebuilt dependencies if needed")
     command.add_argument("bundle", **bundle_opt_kwargs)
-    command.add_argument("host", **host_opt_kwargs)
+    command.add_argument("host", **machine_opt_kwargs)
+    command.add_argument("--build", default=default_machine, **machine_opt_kwargs)
     command.add_argument("--activate", default=False, action='store_true')
     command.add_argument("--post", help="post-processing script")
-    command.set_defaults(func=lambda args: roll(args.bundle, args.host, args.activate,
+    command.set_defaults(func=lambda args: roll(args.bundle, args.build, args.host, args.activate,
                                                 Path(args.post) if args.post is not None else None))
 
     command = subparsers.add_parser("build", help="build prebuilt dependencies")
     command.add_argument("--bundle", default=Bundle.SDK, **bundle_opt_kwargs)
-    command.add_argument("--host", default=default_machine, **host_opt_kwargs)
+    command.add_argument("--build", default=default_machine, **machine_opt_kwargs)
+    command.add_argument("--host", default=default_machine, **machine_opt_kwargs)
     command.add_argument("--only", help="only build packages A, B, and C", metavar="A,B,C",
                          type=parse_set_option_value)
     command.add_argument("--exclude", help="exclude packages A, B, and C", metavar="A,B,C",
                          type=parse_set_option_value, default=set())
     command.add_argument("-v", "--verbose", help="be verbose", action="store_true")
-    command.set_defaults(func=lambda args: build(args.bundle, args.host, args.only, args.exclude, args.verbose))
+    command.set_defaults(func=lambda args: build(args.bundle, args.build, args.host,
+                                                 args.only, args.exclude, args.verbose))
 
     command = subparsers.add_parser("wait", help="wait for prebuilt dependencies if needed")
     command.add_argument("bundle", **bundle_opt_kwargs)
-    command.add_argument("host", **host_opt_kwargs)
+    command.add_argument("host", **machine_opt_kwargs)
     command.set_defaults(func=lambda args: wait(args.bundle, args.host))
 
     command = subparsers.add_parser("bump", help="bump dependency versions")
@@ -104,21 +107,23 @@ def parse_bundle_option_value(raw_bundle: str) -> Bundle:
         raise argparse.ArgumentTypeError(f"invalid choice: {raw_bundle} (choose from '{choices}')")
 
 
-def parse_set_option_value(v: str) -> set[str]:
+def parse_set_option_value(v: str) -> Set[str]:
     return set([v.strip() for v in v.split(",")])
 
 
 def query_toolchain_prefix(machine: MachineSpec,
                            cache_dir: Path) -> Path:
-    identifier = "windows-x86" if machine.os == "windows" and machine.arch in {"x86", "x86_64"} \
-            else machine.identifier
+    if machine.os == "windows":
+        identifier = "windows-x86" if machine.arch in {"x86", "x86_64"} else machine.os_dash_arch
+    else:
+        identifier = machine.identifier
     return cache_dir / f"toolchain-{identifier}"
 
 
 def ensure_toolchain(machine: MachineSpec,
                      cache_dir: Path,
                      version: Optional[str] = None,
-                     on_progress: ProgressCallback = print_progress) -> tuple[Path, SourceState]:
+                     on_progress: ProgressCallback = print_progress) -> Tuple[Path, SourceState]:
     toolchain_prefix = query_toolchain_prefix(machine, cache_dir)
     state = sync(Bundle.TOOLCHAIN, machine, toolchain_prefix, version, on_progress)
     return (toolchain_prefix, state)
@@ -132,7 +137,7 @@ def query_sdk_prefix(machine: MachineSpec,
 def ensure_sdk(machine: MachineSpec,
                cache_dir: Path,
                version: Optional[str] = None,
-               on_progress: ProgressCallback = print_progress) -> tuple[Path, SourceState]:
+               on_progress: ProgressCallback = print_progress) -> Tuple[Path, SourceState]:
     sdk_prefix = query_sdk_prefix(machine, cache_dir)
     state = sync(Bundle.SDK, machine, sdk_prefix, version, on_progress)
     return (sdk_prefix, state)
@@ -218,14 +223,18 @@ def sync(bundle: Bundle,
     return state
 
 
-def roll(bundle: Bundle, machine: MachineSpec, activate: bool, post: Optional[Path]):
+def roll(bundle: Bundle,
+         build_machine: MachineSpec,
+         host_machine: MachineSpec,
+         activate: bool,
+         post: Optional[Path]):
     params = load_dependency_parameters()
     version = params.deps_version
 
     if activate and bundle == Bundle.SDK:
         configure_bootstrap_version(version)
 
-    (public_url, filename) = compute_bundle_parameters(bundle, machine, version)
+    (public_url, filename) = compute_bundle_parameters(bundle, host_machine, version)
 
     # First do a quick check to avoid hitting S3 in most cases.
     request = urllib.request.Request(public_url)
@@ -246,7 +255,7 @@ def roll(bundle: Bundle, machine: MachineSpec, activate: bool, post: Optional[Pa
     if r.returncode != 1:
         raise CommandError(f"unable to access S3: {r.stdout.strip()}")
 
-    artifact = build(bundle, machine)
+    artifact = build(bundle, build_machine, host_machine)
 
     if post is not None:
         post_script = RELENG_DIR / post
@@ -256,7 +265,7 @@ def roll(bundle: Bundle, machine: MachineSpec, activate: bool, post: Optional[Pa
         subprocess.run([
                            sys.executable, post_script,
                            "--bundle=" + bundle.name.lower(),
-                           "--host=" + machine.identifier,
+                           "--host=" + host_machine.identifier,
                            "--artifact=" + str(artifact),
                            "--version=" + version,
                        ],
@@ -272,11 +281,12 @@ def roll(bundle: Bundle, machine: MachineSpec, activate: bool, post: Optional[Pa
 
 
 def build(bundle: Bundle,
-          machine: MachineSpec,
-          only_packages: Optional[set[str]] = None,
-          excluded_packages: set[str] = set(),
+          build_machine: MachineSpec,
+          host_machine: MachineSpec,
+          only_packages: Optional[Set[str]] = None,
+          excluded_packages: Set[str] = set(),
           verbose: bool = False) -> Path:
-    builder = Builder(bundle, machine, verbose)
+    builder = Builder(bundle, build_machine, host_machine, verbose)
     try:
         return builder.build(only_packages, excluded_packages)
     except subprocess.CalledProcessError as e:
@@ -291,13 +301,12 @@ def build(bundle: Bundle,
 class Builder:
     def __init__(self,
                  bundle: Bundle,
+                 build_machine: MachineSpec,
                  host_machine: MachineSpec,
                  verbose: bool):
         self._bundle = bundle
         self._host_machine = host_machine.default_missing()
-        self._build_machine = MachineSpec.make_from_local_system() \
-                .default_missing() \
-                .maybe_adapt_to_host(self._host_machine)
+        self._build_machine = build_machine.default_missing().maybe_adapt_to_host(self._host_machine)
         self._verbose = verbose
         self._default_library = "static"
 
@@ -308,15 +317,15 @@ class Builder:
         self._toolchain_prefix: Optional[Path] = None
         self._build_config: Optional[env.MachineConfig] = None
         self._host_config: Optional[env.MachineConfig] = None
-        self._build_env: dict[str, str] = {}
-        self._host_env: dict[str, str] = {}
+        self._build_env: Dict[str, str] = {}
+        self._host_env: Dict[str, str] = {}
 
         self._ansi_supported = os.environ.get("TERM") != "dumb" \
                     and (self._build_machine.os != "windows" or "WT_SESSION" in os.environ)
 
     def build(self,
-              only_packages: Optional[list[str]],
-              excluded_packages: set[str]) -> Path:
+              only_packages: Optional[List[str]],
+              excluded_packages: Set[str]) -> Path:
         started_at = time.time()
         prepare_ended_at = None
         clone_time_elapsed = None
@@ -398,7 +407,7 @@ class Builder:
 
     def _resolve_dependencies(self,
                               packages: Sequence[PackageSpec],
-                              all_packages: Mapping[str, PackageSpec]) -> dict[str, PackageSpec]:
+                              all_packages: Mapping[str, PackageSpec]) -> Dict[str, PackageSpec]:
         result = {p.identifier: p for p in packages}
         for p in packages:
             self._resolve_package_dependencies(p, all_packages, result)
@@ -483,25 +492,19 @@ class Builder:
     def _clone_repo_if_needed(self, pkg: PackageSpec):
         sourcedir = self._get_sourcedir(pkg)
 
-        git = lambda *args: subprocess.run(["git", *args],
-                                           cwd=sourcedir,
-                                           capture_output=True,
-                                           encoding="utf-8",
-                                           check=True)
+        git = lambda *args, **kwargs: subprocess.run(["git", *args],
+                                                     **kwargs,
+                                                     capture_output=True,
+                                                     encoding="utf-8")
 
         if sourcedir.exists():
             self._print_status(pkg.name, "Reusing existing checkout")
-            current_rev = git("rev-parse", "FETCH_HEAD").stdout.strip()
+            current_rev = git("rev-parse", "FETCH_HEAD", cwd=sourcedir, check=True).stdout.strip()
             if current_rev != pkg.version:
                 self._print_status(pkg.name, "WARNING: Checkout does not match version in deps.toml")
         else:
             self._print_status(pkg.name, "Cloning")
-            sourcedir.mkdir(parents=True, exist_ok=True)
-            git("init")
-            git("remote", "add", "origin", pkg.url)
-            git("fetch", "--depth", "1", "origin", pkg.version)
-            git("checkout", "FETCH_HEAD")
-            git("submodule", "update", "--init", "--recursive", "--depth", "1")
+            clone_shallow(pkg, sourcedir, git)
 
     def _wipe_build_state(self):
         for path in (self._get_outdir(), self._get_builddir_container()):
@@ -624,7 +627,7 @@ class Builder:
 
         return outfile
 
-    def _stage_toolchain_files(self, location: Path) -> list[Path]:
+    def _stage_toolchain_files(self, location: Path) -> List[Path]:
         if self._host_machine.os == "windows":
             toolchain_prefix = self._toolchain_prefix
             mixin_files = [f for f in self._walk_plain_files(toolchain_prefix)
@@ -636,7 +639,7 @@ class Builder:
                  if self._file_is_toolchain_related(f)]
         copy_files(prefix, files, location)
 
-    def _stage_sdk_files(self, location: Path) -> list[Path]:
+    def _stage_sdk_files(self, location: Path) -> List[Path]:
         prefix = self._get_prefix(self._host_machine)
         files = [f for f in self._walk_plain_files(prefix)
                  if self._file_is_sdk_related(f)]
@@ -843,7 +846,7 @@ def wait(bundle: Bundle, machine: MachineSpec):
 
 
 def bump():
-    def run(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    def run(argv: List[str], **kwargs) -> subprocess.CompletedProcess:
         return subprocess.run(argv,
                               capture_output=True,
                               encoding="utf-8",
@@ -898,7 +901,7 @@ def bump_wraps(identifier: str,
         print(f"\tno relevant wraps, only: {', '.join([blob['path'] for blob, _ in all_wraps])}")
         return
 
-    pending_wraps: list[tuple[str, str, PackageSpec]] = []
+    pending_wraps: List[Tuple[str, str, PackageSpec]] = []
     for blob, spec in relevant_wraps:
         filename = blob["path"]
 
@@ -962,9 +965,9 @@ def identifier_from_wrap_filename(filename: str) -> str:
 
 def compute_bundle_parameters(bundle: Bundle,
                               machine: MachineSpec,
-                              version: str) -> tuple[str, str]:
+                              version: str) -> Tuple[str, str]:
     if bundle == Bundle.TOOLCHAIN and machine.os == "windows":
-        os_arch_config = "windows-x86"
+        os_arch_config = "windows-x86" if machine.arch in {"x86", "x86_64"} else machine.os_dash_arch
     else:
         os_arch_config = machine.identifier
     filename = f"{bundle.name.lower()}-{os_arch_config}.tar.xz"
@@ -1035,6 +1038,16 @@ def make_github_auth_header() -> str:
                                        ]).encode("utf-8")).decode("utf-8")
 
 
+def clone_shallow(pkg: PackageSpec, outdir: Path, call_git: Callable):
+    outdir.mkdir(parents=True, exist_ok=True)
+    git = lambda *args: call_git(*args, cwd=outdir, check=True)
+    git("init")
+    git("remote", "add", "origin", pkg.url)
+    git("fetch", "--depth", "1", "origin", pkg.version)
+    git("checkout", "FETCH_HEAD")
+    git("submodule", "update", "--init", "--recursive", "--depth", "1")
+
+
 def parse_option(v: Union[str, dict]) -> OptionSpec:
     if isinstance(v, str):
         return OptionSpec(v)
@@ -1048,7 +1061,7 @@ def parse_dependency(v: Union[str, dict]) -> OptionSpec:
 
 
 def copy_files(fromdir: Path,
-               files: list[Path],
+               files: List[Path],
                todir: Path):
     for filename in files:
         src = fromdir / filename
@@ -1090,7 +1103,7 @@ class SourceState(Enum):
 class DependencyParameters:
     deps_version: str
     bootstrap_version: str
-    packages: dict[str, PackageSpec]
+    packages: Dict[str, PackageSpec]
 
 
 @dataclass
@@ -1099,8 +1112,8 @@ class PackageSpec:
     name: str
     version: str
     url: str
-    options: list[OptionSpec] = field(default_factory=list)
-    dependencies: list[DependencySpec] = field(default_factory=list)
+    options: List[OptionSpec] = field(default_factory=list)
+    dependencies: List[DependencySpec] = field(default_factory=list)
     scope: Optional[str] = None
     when: Optional[str] = None
 

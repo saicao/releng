@@ -4,11 +4,12 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import platform
+import pprint
 import shlex
 import shutil
 import subprocess
 import sys
-from typing import Callable, Literal, Optional
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 from . import env_android, env_apple, env_generic, machine_file
 from .machine_file import bool_to_meson, str_to_meson, strv_to_meson
@@ -18,10 +19,10 @@ from .machine_spec import MachineSpec
 @dataclass
 class MachineConfig:
     machine_file: Path
-    binpath: list[Path]
-    environ: dict[str, str]
+    binpath: List[Path]
+    environ: Dict[str, str]
 
-    def make_merged_environment(self, source_environ: dict[str, str]) -> dict[str, str]:
+    def make_merged_environment(self, source_environ: Dict[str, str]) -> Dict[str, str]:
         menv = {**source_environ}
         menv.update(self.environ)
 
@@ -42,7 +43,7 @@ def call_meson(argv, use_submodule, *args, **kwargs):
 
 def query_meson_entrypoint(use_submodule):
     if use_submodule:
-        return [sys.executable, str(Path(__file__).parent / "meson" / "meson.py")]
+        return [sys.executable, str(INTERNAL_MESON_ENTRYPOINT)]
     return ["meson"]
 
 
@@ -62,13 +63,13 @@ def detect_default_prefix() -> Path:
 
 def generate_machine_configs(build_machine: MachineSpec,
                              host_machine: MachineSpec,
-                             environ: dict[str, str],
+                             environ: Dict[str, str],
                              toolchain_prefix: Optional[Path],
                              build_sdk_prefix: Optional[Path],
                              host_sdk_prefix: Optional[Path],
                              call_selected_meson: Callable,
                              default_library: DefaultLibrary,
-                             outdir: Path) -> tuple[MachineConfig, MachineConfig]:
+                             outdir: Path) -> Tuple[MachineConfig, MachineConfig]:
     is_cross_build = host_machine != build_machine
 
     if is_cross_build:
@@ -106,7 +107,7 @@ def generate_machine_configs(build_machine: MachineSpec,
 def generate_machine_config(machine: MachineSpec,
                             build_machine: MachineSpec,
                             is_cross_build: bool,
-                            environ: dict[str, str],
+                            environ: Dict[str, str],
                             toolchain_prefix: Optional[Path],
                             sdk_prefix: Optional[Path],
                             call_selected_meson: Callable,
@@ -132,6 +133,7 @@ def generate_machine_config(machine: MachineSpec,
 
     outpath = []
     outenv = OrderedDict()
+    outdir.mkdir(parents=True, exist_ok=True)
 
     if machine.is_apple:
         impl = env_apple
@@ -155,6 +157,8 @@ def generate_machine_config(machine: MachineSpec,
     if machine.toolchain_is_msvc:
         builtin_options["b_vscrt"] = str_to_meson(machine.config)
 
+    pkg_config = None
+    vala_compiler = None
     if toolchain_prefix is not None:
         toolchain_bindir = toolchain_prefix / "bin"
         exe_suffix = build_machine.executable_suffix
@@ -196,12 +200,6 @@ def generate_machine_config(machine: MachineSpec,
             binaries["pkg-config"] = strv_to_meson(pkg_config)
 
         vala_compiler = detect_toolchain_vala_compiler(toolchain_prefix, build_machine)
-        if vala_compiler is not None:
-            valac, vapidir = vala_compiler
-            binaries["vala"] = strv_to_meson([
-                str(valac),
-                f"--vapidir={vapidir}",
-            ])
 
     pkg_config_path = shlex.split(environ.get("PKG_CONFIG_PATH", "").replace("\\", "\\\\"))
 
@@ -217,6 +215,22 @@ def generate_machine_config(machine: MachineSpec,
             for f in sdk_bindir.iterdir():
                 binaries[f.stem] = strv_to_meson([str(f)])
 
+    if vala_compiler is not None:
+        valac, vapidir = vala_compiler
+        vala = [
+            str(valac),
+            f"--vapidir={vapidir}",
+        ]
+        if pkg_config is not None:
+            wrapper = outdir / "frida-pkg-config.py"
+            wrapper.write_text(make_pkg_config_wrapper(pkg_config, pkg_config_path), encoding="utf-8")
+            vala += [f"--pkg-config={quote(sys.executable)} {quote(str(wrapper))}"]
+        binaries["vala"] = strv_to_meson(vala)
+
+    qmake6 = shutil.which("qmake6")
+    if qmake6 is not None:
+        binaries["qmake6"] = strv_to_meson([qmake6])
+
     builtin_options["pkg_config_path"] = strv_to_meson(pkg_config_path)
 
     needs_wrapper = needs_exe_wrapper(build_machine, machine, environ)
@@ -226,7 +240,6 @@ def generate_machine_config(machine: MachineSpec,
         if wrapper is not None:
             binaries["exe_wrapper"] = strv_to_meson(wrapper)
 
-    outdir.mkdir(parents=True, exist_ok=True)
     machine_file = outdir / f"frida-{machine.identifier}.txt"
     with machine_file.open("w", encoding="utf-8") as f:
         config.write(f)
@@ -236,13 +249,13 @@ def generate_machine_config(machine: MachineSpec,
 
 def needs_exe_wrapper(build_machine: MachineSpec,
                       host_machine: MachineSpec,
-                      environ: dict[str, str]) -> bool:
+                      environ: Dict[str, str]) -> bool:
     return not can_run_host_binaries(build_machine, host_machine, environ)
 
 
 def can_run_host_binaries(build_machine: MachineSpec,
                           host_machine: MachineSpec,
-                          environ: dict[str, str]) -> bool:
+                          environ: Dict[str, str]) -> bool:
     if host_machine == build_machine:
         return True
 
@@ -254,7 +267,7 @@ def can_run_host_binaries(build_machine: MachineSpec,
 
     if host_os == build_os:
         if build_os == "windows":
-            return True
+            return build_arch == "arm64" or host_arch != "arm64"
 
         if build_os == "macos":
             if build_arch == "arm64" and host_arch == "x86_64":
@@ -268,7 +281,10 @@ def can_run_host_binaries(build_machine: MachineSpec,
 
 
 def find_exe_wrapper(machine: MachineSpec,
-                     environ: dict[str, str]) -> Optional[list[str]]:
+                     environ: Dict[str, str]) -> Optional[List[str]]:
+    if machine.arch == "arm64beilp32":
+        return None
+
     qemu_sysroot = environ.get("FRIDA_QEMU_SYSROOT")
     if qemu_sysroot is None:
         return None
@@ -281,8 +297,27 @@ def find_exe_wrapper(machine: MachineSpec,
     return [qemu_binary, "-L", qemu_sysroot]
 
 
+def make_pkg_config_wrapper(pkg_config: List[str], pkg_config_path: List[str]) -> str:
+    return "\n".join([
+        "import os",
+        "import subprocess",
+        "import sys",
+        "",
+        "args = [",
+        f" {pprint.pformat(pkg_config, indent=4)[1:-1]},",
+        "    *sys.argv[1:],",
+        "]",
+        "env = {",
+        "    **os.environ,",
+        f"    'PKG_CONFIG_PATH': {repr(os.pathsep.join(pkg_config_path))},",
+        "}",
+        f"p = subprocess.run(args, env=env)",
+        "sys.exit(p.returncode)"
+    ])
+
+
 def detect_toolchain_vala_compiler(toolchain_prefix: Path,
-                                   build_machine: MachineSpec) -> Optional[tuple[Path, Path]]:
+                                   build_machine: MachineSpec) -> Optional[Tuple[Path, Path]]:
     datadir = next((toolchain_prefix / "share").glob("vala-*"), None)
     if datadir is None:
         return None
@@ -300,9 +335,17 @@ def build_envvar_to_host(name: str) -> str:
     return name
 
 
+def quote(s: str) -> str:
+    if " " not in s:
+        return s
+    return "\"" + s.replace("\"", "\\\"") + "\""
+
+
 class QEMUNotFoundError(Exception):
     pass
 
+
+INTERNAL_MESON_ENTRYPOINT = Path(__file__).resolve().parent / "meson" / "meson.py"
 
 # Based on mesonbuild/envconfig.py and mesonbuild/compilers/compilers.py
 TOOLCHAIN_ENVVARS = {
@@ -377,4 +420,5 @@ QEMU_ARCHS = {
     "armhf": "arm",
     "armbe8": "armeb",
     "arm64": "aarch64",
+    "arm64be": "aarch64_be",
 }
