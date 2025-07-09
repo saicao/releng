@@ -332,8 +332,8 @@ dependencies = [
 
 [capstone]
 name = "Capstone"
-version = "e98746112da0a40b2ccd0340db0d20cca5f97950"
-url = "https://github.com/frida/capstone.git"
+version = "e4332bab09ce9db52bc0c99198282f7c0e34b17b"
+url = "https://github.com/saicao/capstone.git"
 options = [
     "-Darchs=all",
     "-Duse_arch_registration=true",
