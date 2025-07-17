@@ -46,6 +46,7 @@ class MachineSpec:
         tokens = raw_spec.split("-")
         if len(tokens) in {3, 4}:
             arch = tokens[0]
+            print(arch)
             m = TARGET_TRIPLET_ARCH_PATTERN.match(arch)
             if m is not None:
                 kernel = tokens[-2]
