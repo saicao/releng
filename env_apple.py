@@ -2,7 +2,7 @@ from configparser import ConfigParser
 from pathlib import Path
 import shlex
 import subprocess
-from typing import Callable, Optional
+from typing import Callable, Dict, List, Optional
 
 from .machine_file import strv_to_meson
 from .machine_spec import MachineSpec
@@ -11,13 +11,13 @@ from .machine_spec import MachineSpec
 def init_machine_config(machine: MachineSpec,
                         build_machine: MachineSpec,
                         is_cross_build: bool,
-                        environ: dict[str, str],
+                        environ: Dict[str, str],
                         toolchain_prefix: Optional[Path],
                         sdk_prefix: Optional[Path],
                         call_selected_meson: Callable,
                         config: ConfigParser,
-                        outpath: list[str],
-                        outenv: dict[str, str],
+                        outpath: List[str],
+                        outenv: Dict[str, str],
                         outdir: Path):
     xcenv = {**environ}
     if machine.arch == "arm64eoabi":
@@ -35,6 +35,15 @@ def init_machine_config(machine: MachineSpec,
                                   check=True).stdout.strip()
         except subprocess.CalledProcessError as e:
             raise XCRunError("\n\t| ".join(e.stderr.strip().split("\n")))
+
+    clang_arch = APPLE_CLANG_ARCHS.get(machine.arch, machine.arch)
+
+    os_minver = APPLE_MINIMUM_OS_VERSIONS.get(machine.os_dash_arch,
+                                              APPLE_MINIMUM_OS_VERSIONS[machine.os])
+
+    target = f"{clang_arch}-apple-{machine.os}{os_minver}"
+    if machine.config is not None:
+        target += "-" + machine.config
 
     sdk_name = APPLE_SDKS[machine.os_dash_config]
     sdk_path = xcrun("--sdk", sdk_name, "--show-sdk-path")
@@ -59,21 +68,14 @@ def init_machine_config(machine: MachineSpec,
             argv += rest[0]
         if identifier == "cpp" and not use_static_libcxx:
             argv += ["-stdlib=libc++"]
+        if identifier == "swift":
+            argv += ["-target", target, "-sdk", sdk_path]
 
         raw_val = str(argv)
         if identifier in {"c", "cpp"}:
             raw_val += " + common_flags"
 
         binaries[identifier] = raw_val
-
-    clang_arch = APPLE_CLANG_ARCHS.get(machine.arch, machine.arch)
-
-    os_minver = APPLE_MINIMUM_OS_VERSIONS.get(machine.os_dash_arch,
-                                              APPLE_MINIMUM_OS_VERSIONS[machine.os])
-
-    target = f"{clang_arch}-apple-{machine.os}{os_minver}"
-    if machine.config is not None:
-        target += "-" + machine.config
 
     read_envflags = lambda name: shlex.split(environ.get(name, ""))
 
@@ -146,7 +148,7 @@ APPLE_CLANG_ARCHS = {
 }
 
 APPLE_MINIMUM_OS_VERSIONS = {
-    "macos":        "10.9",
+    "macos":        "10.13",
     "macos-arm64":  "11.0",
     "macos-arm64e": "11.0",
     "ios":          "8.0",
@@ -159,6 +161,7 @@ APPLE_BINARIES = [
     ("cpp",               "clang++"),
     ("objc",              "#c"),
     ("objcpp",            "#cpp"),
+    ("swift",             "swiftc"),
 
     ("ar",                "ar"),
     ("nm",                "llvm-nm"),

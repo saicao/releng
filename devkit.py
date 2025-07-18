@@ -1,5 +1,7 @@
 from collections import OrderedDict
+from enum import Enum
 import itertools
+import locale
 import os
 from pathlib import Path
 import re
@@ -26,12 +28,18 @@ ASSETS_PATH = Path(__file__).parent / "devkit-assets"
 INCLUDE_PATTERN = re.compile(r"#include\s+[<\"](.*?)[>\"]")
 
 
+class DepSymbolScope(str, Enum):
+    PREFIXED = "prefixed"
+    ORIGINAL = "original"
+
+
 class CompilerApplication:
     def __init__(self,
                  kit: str,
                  machine: MachineSpec,
                  meson_config: Mapping[str, Union[str, Sequence[str]]],
-                 output_dir: Path):
+                 output_dir: Path,
+                 dep_symbol_scope: DepSymbolScope = DepSymbolScope.PREFIXED):
         self.kit = kit
         package, umbrella_header = DEVKITS[kit]
         self.package = package
@@ -41,6 +49,7 @@ class CompilerApplication:
         self.meson_config = meson_config
         self.compiler_argument_syntax = None
         self.output_dir = output_dir
+        self.dep_symbol_scope = dep_symbol_scope
         self.library_filename = None
 
     def run(self):
@@ -130,7 +139,13 @@ class CompilerApplication:
         umbrella_header = header_files[0]
         processed_header_files = {umbrella_header}
         ingest_header(umbrella_header, header_files, processed_header_files, devkit_header_lines)
-        if kit == "frida-gumjs":
+        if kit in {"frida-gum", "frida-gumjs"} and machine.os == "none":
+            gum_dir = umbrella_header_path.parent
+            if kit == "frida-gumjs":
+                gum_dir = gum_dir.parent.parent / "gum"
+            barebone_header = gum_dir / "backend-barebone" / "include" / "gum" / "gumbarebone.h"
+            ingest_header(barebone_header, header_files, processed_header_files, devkit_header_lines)
+        if kit == "frida-gumjs" and machine.os != "none":
             inspector_server_header = umbrella_header_path.parent / "guminspectorserver.h"
             ingest_header(inspector_server_header, header_files, processed_header_files, devkit_header_lines)
         if kit == "frida-core" and machine.os == "android":
@@ -138,7 +153,7 @@ class CompilerApplication:
             ingest_header(selinux_header, header_files, processed_header_files, devkit_header_lines)
         devkit_header = u"".join(devkit_header_lines)
 
-        if package.startswith("frida-gumjs"):
+        if package.startswith("frida-gum"):
             config = """#ifndef GUM_STATIC
 # define GUM_STATIC
 #endif
@@ -262,9 +277,8 @@ class CompilerApplication:
             shutil.rmtree(combined_dir)
 
         objcopy = meson_config.get("objcopy", None)
-        if objcopy is not None:
+        if self.dep_symbol_scope is DepSymbolScope.PREFIXED and objcopy is not None:
             thirdparty_symbol_mappings = get_thirdparty_symbol_mappings(output_path, meson_config)
-
             renames = "\n".join([f"{original} {renamed}" for original, renamed in thirdparty_symbol_mappings]) + "\n"
             with tempfile.NamedTemporaryFile() as renames_file:
                 renames_file.write(renames.encode("utf-8"))
@@ -438,9 +452,9 @@ def call_pkgconfig(argv, meson_config):
 
 
 def detect_compiler_argument_syntax(meson_config):
-    if subprocess.run(meson_config["c"],
+    if "Microsoft " in subprocess.run(meson_config["c"],
                       capture_output=True,
-                      encoding="utf-8").stderr.startswith("Microsoft "):
+                      encoding=locale.getpreferredencoding()).stderr:
         return "msvc"
 
     return "unix"

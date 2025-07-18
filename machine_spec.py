@@ -2,7 +2,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import platform
 import re
-from typing import Optional
+import subprocess
+from typing import List, Optional
+
+if platform.system() == "Windows":
+    import ctypes
+    from ctypes import wintypes
 
 
 @dataclass
@@ -14,7 +19,22 @@ class MachineSpec:
 
     @staticmethod
     def make_from_local_system() -> MachineSpec:
-        return MachineSpec(detect_os(), detect_arch())
+        os = detect_os()
+        arch = detect_arch()
+        config = None
+
+        if os == "linux":
+            try:
+                output = subprocess.run(["ldd", "--version"],
+                                        stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT,
+                                        encoding="utf-8").stdout
+                if "musl" in output:
+                    config = "musl"
+            except:
+                pass
+
+        return MachineSpec(os, arch, config)
 
     @staticmethod
     def parse(raw_spec: str) -> MachineSpec:
@@ -41,12 +61,18 @@ class MachineSpec:
                 if arch[0] == "i":
                     arch = "x86"
                 elif arch == "arm":
-                    if system == "gnueabihf":
+                    if system.endswith("eabihf"):
                         arch = "armhf"
                     elif os == "qnx" and system.endswith("eabi"):
                         arch = "armeabi"
+                elif arch == "armeb":
+                    arch = "armbe8"
                 elif arch == "aarch64":
                     arch = "arm64"
+                elif arch == "aarch64_be":
+                    arch = "arm64be"
+                if system.endswith("_ilp32"):
+                    arch += "ilp32"
 
                 if system.startswith("musl"):
                     config = "musl"
@@ -85,8 +111,10 @@ class MachineSpec:
         return self.evolve(config=config)
 
     def maybe_adapt_to_host(self, host_machine: MachineSpec) -> MachineSpec:
+        if self.identifier == host_machine.identifier and host_machine.triplet is not None:
+            return host_machine
         if self.os == "windows":
-            if self.arch == "x86_64" and host_machine.arch == "x86":
+            if host_machine.arch in {"x86_64", "x86"}:
                 return host_machine
             if self.arch == host_machine.arch:
                 return host_machine
@@ -117,7 +145,7 @@ class MachineSpec:
         return True
 
     @property
-    def meson_optimization_options(self) -> list[str]:
+    def meson_optimization_options(self) -> List[str]:
         if self.config_is_optimized:
             optimization = "s"
             ndebug = "true"
@@ -135,7 +163,7 @@ class MachineSpec:
 
     @property
     def msvc_platform(self) -> str:
-        return "x64" if self.arch == "x86_64" else "x86"
+        return "x64" if self.arch == "x86_64" else self.arch
 
     @property
     def is_apple(self) -> str:
@@ -182,7 +210,7 @@ class MachineSpec:
         arch = self.arch
         if arch in {"x86_64", "s390x"}:
             return 8
-        if arch.startswith("arm64") or arch.startswith("mips64"):
+        if (arch.startswith("arm64") and not arch.endswith("ilp32")) or arch.startswith("mips64"):
             return 8
         return 4
 
@@ -212,11 +240,85 @@ def detect_os() -> str:
 
 
 def detect_arch() -> str:
+    if platform.system() == "Windows":
+        return detect_arch_windows()
     arch = platform.machine().lower()
-    if arch == "amd64":
-        arch = "x86_64"
-    return arch
+    return ARCHS.get(arch, arch)
 
+def detect_arch_windows():
+    try:
+        code = detect_arch_windows_modern()
+    except AttributeError:
+        code = detect_arch_windows_legacy()
+    if code == PROCESSOR_ARCHITECTURE_INTEL:
+        return "x86"
+    elif code in {PROCESSOR_ARCHITECTURE_AMD64, IMAGE_FILE_MACHINE_AMD64}:
+        return "x86_64"
+    elif code in {PROCESSOR_ARCHITECTURE_ARM64, IMAGE_FILE_MACHINE_ARM64}:
+        return "arm64"
+    else:
+        raise RuntimeError(f"unrecognized native architecture code: {code!r}")
+
+def detect_arch_windows_modern():
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    try:
+        is_wow64_process = kernel32.IsWow64Process2
+    except AttributeError:
+        raise
+
+    is_wow64_process.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.WORD),
+    )
+    is_wow64_process.restype = wintypes.BOOL
+
+    process_machine = wintypes.WORD(0)
+    native_machine  = wintypes.WORD(0)
+
+    ok = is_wow64_process(
+        kernel32.GetCurrentProcess(),
+        ctypes.byref(process_machine),
+        ctypes.byref(native_machine)
+    )
+    if not ok:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    return native_machine.value
+
+def detect_arch_windows_legacy():
+    class SYSTEM_INFO(ctypes.Structure):
+        _fields_ = [
+            ("wProcessorArchitecture",      wintypes.WORD),
+            ("wReserved",                   wintypes.WORD),
+            ("dwPageSize",                  wintypes.DWORD),
+            ("lpMinimumApplicationAddress", ctypes.c_void_p),
+            ("lpMaximumApplicationAddress", ctypes.c_void_p),
+            ("dwActiveProcessorMask",       ctypes.c_void_p),
+            ("dwNumberOfProcessors",        wintypes.DWORD),
+            ("dwProcessorType",             wintypes.DWORD),
+            ("dwAllocationGranularity",     wintypes.DWORD),
+            ("wProcessorLevel",             wintypes.WORD),
+            ("wProcessorRevision",          wintypes.WORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    get_native_system_info = kernel32.GetNativeSystemInfo
+    get_native_system_info.argtypes = (ctypes.POINTER(SYSTEM_INFO),)
+    get_native_system_info.restype = None
+
+    info = SYSTEM_INFO()
+    get_native_system_info(ctypes.byref(info))
+    return info.wProcessorArchitecture
+
+
+ARCHS = {
+    "amd64": "x86_64",
+    "armv7l": "armhf",
+    "aarch64": "arm64",
+}
 
 KERNELS = {
     "windows": "nt",
@@ -230,27 +332,35 @@ KERNELS = {
 }
 
 CPU_FAMILIES = {
-    "armbe8":     "arm",
-    "armeabi":    "arm",
-    "armhf":      "arm",
+    "armbe8":       "arm",
+    "armeabi":      "arm",
+    "armhf":        "arm",
+    "armv6kz":      "arm",
 
-    "arm64":      "aarch64",
-    "arm64e":     "aarch64",
-    "arm64eoabi": "aarch64",
+    "arm64":        "aarch64",
+    "arm64be":      "aarch64",
+    "arm64beilp32": "aarch64",
+    "arm64e":       "aarch64",
+    "arm64eoabi":   "aarch64",
 
-    "mipsel":     "mips",
-    "mips64el":   "mips64",
+    "mipsel":       "mips",
+    "mips64el":     "mips64",
+
+    "powerpc":      "ppc"
 }
 
 CPU_TYPES = {
-    "arm":        "armv7",
-    "armbe8":     "armv6",
-    "armhf":      "armv7hf",
-    "armeabi":    "armv7eabi",
+    "arm":          "armv7",
+    "armbe8":       "armv6",
+    "armhf":        "armv7hf",
+    "armeabi":      "armv7eabi",
+    "armv6kz":      "armv6",
 
-    "arm64":      "aarch64",
-    "arm64e":     "aarch64",
-    "arm64eoabi": "aarch64",
+    "arm64":        "aarch64",
+    "arm64be":      "aarch64",
+    "arm64beilp32": "aarch64",
+    "arm64e":       "aarch64",
+    "arm64eoabi":   "aarch64",
 }
 
 CPU_TYPES_PER_OS_OVERRIDES = {
@@ -258,6 +368,7 @@ CPU_TYPES_PER_OS_OVERRIDES = {
         "arm":        "armv5t",
         "armbe8":     "armv6t",
         "armhf":      "armv7a",
+        "armv6kz":    "armv6t",
 
         "mips":       "mips1",
         "mipsel":     "mips1",
@@ -275,10 +386,21 @@ CPU_TYPES_PER_OS_OVERRIDES = {
 }
 
 BIG_ENDIAN_ARCHS = {
+    "arm64be",
+    "arm64beilp32",
     "armbe8",
     "mips",
     "mips64",
+    "ppc",
+    "ppc64",
     "s390x",
 }
 
-TARGET_TRIPLET_ARCH_PATTERN = re.compile(r"^(i.86|x86_64|arm(v\w+)?|aarch64|mips\w*|s390x)$")
+TARGET_TRIPLET_ARCH_PATTERN = re.compile(r"^(i.86|x86_64|arm\w*|aarch64(_be)?|mips\w*|powerpc|s390x)$")
+
+PROCESSOR_ARCHITECTURE_INTEL = 0
+PROCESSOR_ARCHITECTURE_AMD64 = 9
+PROCESSOR_ARCHITECTURE_ARM64 = 12
+
+IMAGE_FILE_MACHINE_AMD64 = 0x8664
+IMAGE_FILE_MACHINE_ARM64 = 0xAA64
